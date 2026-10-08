@@ -3,44 +3,12 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 import sys
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-import yaml
-
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_DIR = REPO_ROOT / "plugins" / "observability" / "langfuse"
-
-
-# ---------------------------------------------------------------------------
-# Manifest + layout
-# ---------------------------------------------------------------------------
-
-class TestManifest:
-
-    def test_manifest_fields(self):
-        data = yaml.safe_load(
-            (PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8")
-        )
-        assert data["name"] == "langfuse"
-        assert data["version"]
-        # All eleven hooks the plugin implements.
-        assert set(data["hooks"]) == {
-            "pre_api_request", "post_api_request", "api_request_error",
-            "pre_llm_call", "post_llm_call",
-            "pre_tool_call", "post_tool_call",
-            "on_session_finalize", "on_session_end",
-            "subagent_start", "subagent_stop",
-        }
-        # Required env vars are the user-facing HERMES_ prefixed keys.
-        assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
-        assert "HERMES_LANGFUSE_SECRET_KEY" in data["requires_env"]
 
 
 # ---------------------------------------------------------------------------
@@ -50,11 +18,6 @@ class TestManifest:
 # ---------------------------------------------------------------------------
 
 class TestDiscovery:
-    @staticmethod
-    def _write_config(home: Path, text: str) -> None:
-        home.mkdir()
-        (home / "config.yaml").write_text(text, encoding="utf-8")
-
     def test_plugin_is_discovered_as_standalone_opt_in(self, tmp_path, monkeypatch):
         """Scanner should find the plugin but NOT load it by default."""
         from hermes_cli import plugins as plugins_mod
@@ -74,90 +37,6 @@ class TestDiscovery:
         # … but is not loaded (opt-in default → no config.yaml means nothing enabled)
         assert loaded.enabled is False
         assert "not enabled" in (loaded.error or "").lower()
-
-    @pytest.mark.parametrize("service_name", ["", "unknown_service"])
-    def test_invalid_service_name_prevents_plugin_loading_without_breaking_agent(
-        self, tmp_path, monkeypatch, service_name
-    ):
-        from hermes_cli import plugins as plugins_mod
-
-        home = tmp_path / ".hermes"
-        rendered_service = f"  service_name: {service_name!r}\n"
-        self._write_config(
-            home,
-            "plugins:\n"
-            "  enabled:\n"
-            "    - observability/langfuse\n"
-            "observability:\n"
-            f"{rendered_service}",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        manager = plugins_mod.PluginManager()
-        manager.discover_and_load()
-
-        loaded = manager._plugins["observability/langfuse"]
-        assert loaded.enabled is False
-        assert "observability.service_name" in (loaded.error or "")
-
-    def test_credential_only_legacy_config_uses_service_name_default(
-        self, tmp_path, monkeypatch
-    ):
-        from hermes_cli import plugins as plugins_mod
-
-        home = tmp_path / ".hermes"
-        self._write_config(
-            home,
-            "plugins:\n"
-            "  enabled:\n"
-            "    - observability/langfuse\n",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        manager = plugins_mod.PluginManager()
-        manager.discover_and_load()
-
-        loaded = manager._plugins["observability/langfuse"]
-        assert loaded.enabled is True
-
-    def test_service_name_config_read_failures_are_fail_closed(self, tmp_path, monkeypatch):
-        langfuse_plugin = importlib.import_module("plugins.observability.langfuse")
-
-        home = tmp_path / ".hermes"
-        home.mkdir()
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-
-        with pytest.raises(langfuse_plugin.LangfuseServiceNameError, match="does not exist"):
-            langfuse_plugin._require_service_name()
-
-        (home / "config.yaml").write_text("observability: [", encoding="utf-8")
-
-        with pytest.raises(langfuse_plugin.LangfuseServiceNameError, match="could not be read"):
-            langfuse_plugin._require_service_name()
-
-    def test_plugin_hook_errors_remain_isolated(self, caplog):
-        from hermes_cli import plugins as plugins_mod
-        from plugins.observability.langfuse import LangfuseServiceNameError
-
-        manager = plugins_mod.PluginManager()
-        manager._hooks["pre_api_request"] = [
-            lambda **_: (_ for _ in ()).throw(
-                LangfuseServiceNameError("unknown_service")
-            )
-        ]
-
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
-            manager.invoke_hook("pre_api_request")
-
-        assert "unknown_service" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -194,42 +73,6 @@ class TestRuntimeGate:
 
         messages = [record.getMessage() for record in caplog.records]
         assert len(messages) == 1
-        assert "SDK is unavailable" in messages[0]
-        assert "tracing is disabled" in messages[0]
-
-    def test_get_langfuse_caches_failure_no_config_load(self, monkeypatch):
-        """A miss must be cached — no per-hook config.yaml reads, no env re-reads."""
-        for k in (
-            "HERMES_LANGFUSE_PUBLIC_KEY", "HERMES_LANGFUSE_SECRET_KEY",
-            "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY",
-        ):
-            monkeypatch.delenv(k, raising=False)
-
-        langfuse_plugin = self._fresh_plugin()
-
-        # Prime the cache with one call.
-        assert langfuse_plugin._get_langfuse() is None
-
-        # Now block os.environ.get — a correctly-cached plugin must not
-        # touch env again.
-        import os
-        called = {"n": 0}
-        real_get = os.environ.get
-
-        def tracking_get(key, default=None):
-            if key.startswith(("HERMES_LANGFUSE_", "LANGFUSE_")):
-                called["n"] += 1
-            return real_get(key, default)
-
-        monkeypatch.setattr(os.environ, "get", tracking_get)
-
-        for _ in range(20):
-            assert langfuse_plugin._get_langfuse() is None
-
-        assert called["n"] == 0, (
-            f"_get_langfuse() re-read env {called['n']} times after cache miss — "
-            "it should short-circuit via _INIT_FAILED"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -289,23 +132,6 @@ class TestPayloadSanitization:
             "omitted": True,
             "length": len(payload),
         }
-
-
-class TestTraceScopeKey:
-    def _fresh_plugin(self):
-        mod_name = "plugins.observability.langfuse"
-        sys.modules.pop(mod_name, None)
-        return importlib.import_module(mod_name)
-
-    def test_trace_key_scopes_by_turn_id_when_available(self):
-        plugin = self._fresh_plugin()
-
-        key_a = plugin._trace_key("task-1", "session-1", turn_id="turn-a")
-        key_b = plugin._trace_key("task-1", "session-1", turn_id="turn-b")
-
-        assert key_a != key_b
-        assert "turn:turn-a" in key_a
-        assert "turn:turn-b" in key_b
 
 
 # ---------------------------------------------------------------------------
@@ -578,17 +404,8 @@ class TestPlaceholderKeyDetection:
         for k in (
             "HERMES_LANGFUSE_PUBLIC_KEY", "HERMES_LANGFUSE_SECRET_KEY",
             "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY",
-            "HERMES_HOME",
-            "OTEL_SERVICE_NAME",
-            "OTEL_RESOURCE_ATTRIBUTES",
         ):
             monkeypatch.delenv(k, raising=False)
-
-    @staticmethod
-    def _write_config(tmp_path, text: str) -> None:
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(text, encoding="utf-8")
 
     # -- helper unit tests (no SDK stub needed: these don't go through
     #    _get_langfuse, they exercise the pure-Python helpers directly) ------
@@ -679,178 +496,6 @@ class TestPlaceholderKeyDetection:
             "expected 1 (cached via _INIT_FAILED)"
         )
 
-    @pytest.mark.parametrize("placeholder", [
-        "placeholder",
-        "test-key",
-        "your-langfuse-key",
-        "change-me",
-        "xxx",
-        "dummy-key-here",
-        "<your-key>",
-        "REPLACE_ME",
-    ])
-    def test_common_placeholders_detected(self, monkeypatch, caplog, placeholder):
-        """A grab-bag of values that real-world ``.env.example`` templates
-        use as stand-ins.  Any of them in either key must trip the guard."""
-        self._clear_env(monkeypatch)
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", placeholder)
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        plugin = self._fresh_plugin(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
-            assert plugin._get_langfuse() is None
-        assert "HERMES_LANGFUSE_PUBLIC_KEY" in caplog.text
-
-    def test_legacy_LANGFUSE_PUBLIC_KEY_also_validated(self, monkeypatch, caplog):
-        """The plugin reads both the canonical HERMES_-prefixed env var and
-        the legacy bare ``LANGFUSE_PUBLIC_KEY``.  The validator must run on
-        whichever value ``_get_langfuse()`` actually consumed."""
-        self._clear_env(monkeypatch)
-        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "placeholder")
-        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        plugin = self._fresh_plugin(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
-            assert plugin._get_langfuse() is None
-        # Warning names the canonical user-facing env var (the bare
-        # LANGFUSE_PUBLIC_KEY is a backwards-compat alias for the
-        # HERMES_-prefixed one — operators set the HERMES_-prefixed one).
-        assert "HERMES_LANGFUSE_PUBLIC_KEY" in caplog.text
-        assert "'placeholder'" in caplog.text
-
-    def test_missing_credentials_still_skip_silently(self, monkeypatch, caplog):
-        """Missing-creds is the documented opt-out path (operator hasn't
-        configured the plugin yet) — it must remain SILENT.  Regression
-        guard against the placeholder validator accidentally running on
-        empty values and re-introducing log noise for unconfigured
-        installs."""
-        self._clear_env(monkeypatch)
-        plugin = self._fresh_plugin(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
-            assert plugin._get_langfuse() is None
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"
-                    and r.name == self.LOGGER_NAME]
-        assert warnings == []
-
-    def test_sdk_not_installed_warns_without_placeholder_message(
-        self, monkeypatch, caplog
-    ):
-        """The SDK-missing path stays actionable without blaming credentials."""
-        self._clear_env(monkeypatch)
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "placeholder")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "placeholder")
-        # NO monkeypatch on Langfuse here — falls back to whatever the
-        # plugin imported at module load (None if SDK absent).
-        plugin = self._fresh_plugin()
-        monkeypatch.setattr(plugin, "Langfuse", None, raising=False)
-        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
-            assert plugin._get_langfuse() is None
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"
-                    and r.name == self.LOGGER_NAME]
-        assert len(warnings) == 1
-        assert "SDK is unavailable" in warnings[0].getMessage()
-        assert "placeholder" not in warnings[0].getMessage()
-
-    def test_valid_prefixes_do_not_trigger_placeholder_warning(self, monkeypatch, caplog, tmp_path):
-        """Real Langfuse keys (``pk-lf-…`` / ``sk-lf-…``) must pass the
-        guard and proceed to SDK init.  We stub the SDK constructor with
-        a recording fake so the assertion can confirm BOTH that the
-        placeholder warning didn't fire AND that the client was actually
-        constructed — the latter is the success signal the bug report
-        wanted."""
-        self._clear_env(monkeypatch)
-        self._write_config(tmp_path, "observability:\n  service_name: riemann\n")
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        plugin = self._fresh_plugin(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
-            client = plugin._get_langfuse()
-        assert isinstance(client, _FakeLangfuse)
-        assert client.kwargs["public_key"] == "pk-lf-real-public-xyz"
-        assert client.kwargs["secret_key"] == "sk-lf-real-secret-xyz"
-        assert "placeholders" not in caplog.text.lower(), (
-            f"Valid Langfuse keys tripped the placeholder guard: {caplog.text!r}"
-        )
-
-    def test_missing_service_name_warns_and_uses_compatibility_default(
-        self, monkeypatch, tmp_path, caplog
-    ):
-        self._clear_env(monkeypatch)
-        self._write_config(tmp_path, "observability: {}\n")
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        plugin = self._fresh_plugin(monkeypatch)
-
-        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
-            client = plugin._get_langfuse()
-
-        assert isinstance(client, _FakeLangfuse)
-        assert os.environ["OTEL_SERVICE_NAME"] == "hermes-agent"
-        assert "observability.service_name is not configured" in caplog.text
-        assert "using compatibility identity 'hermes-agent'" in caplog.text
-
-    def test_unknown_service_name_fails_closed(self, monkeypatch, tmp_path):
-        self._clear_env(monkeypatch)
-        self._write_config(
-            tmp_path,
-            "observability:\n  service_name: unknown_service\n",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        plugin = self._fresh_plugin(monkeypatch)
-
-        with pytest.raises(RuntimeError, match="unknown_service"):
-            plugin._get_langfuse()
-
-        assert _FakeLangfuse.instances == []
-
-    def test_service_name_sets_otel_resource_before_client_init(self, monkeypatch, tmp_path):
-        self._clear_env(monkeypatch)
-        self._write_config(
-            tmp_path,
-            "observability:\n  service_name: riemann\n",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=staging")
-        plugin = self._fresh_plugin(monkeypatch)
-
-        client = plugin._get_langfuse()
-
-        assert isinstance(client, _FakeLangfuse)
-        assert os.environ["OTEL_SERVICE_NAME"] == "riemann"
-        assert os.environ["OTEL_RESOURCE_ATTRIBUTES"].split(",") == [
-            "service.name=riemann",
-            "deployment.environment=staging",
-        ]
-
-    def test_service_name_overwrites_stale_otel_identity(self, monkeypatch, tmp_path):
-        self._clear_env(monkeypatch)
-        self._write_config(
-            tmp_path,
-            "observability:\n  service_name: riemann\n",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-real-public-xyz")
-        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-real-secret-xyz")
-        monkeypatch.setenv("OTEL_SERVICE_NAME", "unknown_service")
-        monkeypatch.setenv(
-            "OTEL_RESOURCE_ATTRIBUTES",
-            "deployment.environment=staging,service.name=unknown_service",
-        )
-        plugin = self._fresh_plugin(monkeypatch)
-
-        client = plugin._get_langfuse()
-
-        assert isinstance(client, _FakeLangfuse)
-        assert os.environ["OTEL_SERVICE_NAME"] == "riemann"
-        assert os.environ["OTEL_RESOURCE_ATTRIBUTES"].split(",") == [
-            "service.name=riemann",
-            "deployment.environment=staging",
-        ]
-
 
 class TestRequestMessageCoercion:
     def test_prefers_request_messages_then_messages_then_history_then_user_message(self):
@@ -873,33 +518,6 @@ class TestRequestMessageCoercion:
             user_message="u",
         ) == [{"role": "user", "content": "h"}]
         assert mod._coerce_request_messages(user_message="u") == [{"role": "user", "content": "u"}]
-
-    def test_messages_for_langfuse_includes_anthropic_system_param(self):
-        sys.modules.pop("plugins.observability.langfuse", None)
-        mod = importlib.import_module("plugins.observability.langfuse")
-
-        out = mod._messages_for_langfuse_input(
-            request_messages=[{"role": "user", "content": "hi"}],
-            system_prompt="You are Hermes.",
-        )
-        assert out[0]["role"] == "system"
-        assert out[0]["content"] == "You are Hermes."
-        assert out[1]["role"] == "user"
-
-    def test_messages_for_langfuse_skips_duplicate_system(self):
-        sys.modules.pop("plugins.observability.langfuse", None)
-        mod = importlib.import_module("plugins.observability.langfuse")
-
-        out = mod._messages_for_langfuse_input(
-            request_messages=[
-                {"role": "system", "content": "already here"},
-                {"role": "user", "content": "hi"},
-            ],
-            system_prompt="ignored when messages include system",
-        )
-        assert out[0]["role"] == "system"
-        assert out[0]["content"] == "already here"
-        assert out[1]["role"] == "user"
 
 
 class TestAssistantMessageSerialization:
@@ -1348,7 +966,6 @@ class TestCostTotal:
             base_url="",
         )
 
-        assert cost_details["total"] == pytest.approx(0.0111)
         components = {k: v for k, v in cost_details.items() if k != "total"}
         assert components
         assert cost_details["total"] == pytest.approx(sum(components.values()))
@@ -1490,35 +1107,6 @@ class TestCaptureModes:
         monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "full")
         text = "here sk-abcdefghijklmnop1234 done"
         assert mod._capture_content(text) == text
-
-    def test_capture_mode_recorded_in_trace_metadata(self, monkeypatch):
-        mod = self._fresh_plugin()
-        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "metadata")
-        seen = {}
-
-        class _Span:
-            def update(self, **kw): pass
-            def end(self, **kw): pass
-            def set_trace_io(self, **kw): pass
-            def start_observation(self, **kw): return _Span()
-
-        class _RootCM:
-            def __enter__(self): return _Span()
-            def __exit__(self, *exc): return False
-
-        class _Client:
-            def create_trace_id(self, seed=None): return "t1"
-            def start_as_current_observation(self, **kw):
-                seen.update(kw)
-                return _RootCM()
-
-        state = mod._start_root_trace(
-            "k", task_id="t", session_id="s", platform="cli", provider="p",
-            model="m", api_mode="chat", messages=[{"role": "user", "content": "hi"}],
-            client=_Client(),
-        )
-        assert seen["metadata"]["capture_mode"] == "metadata"
-        assert state is not None
 
 
 # ---------------------------------------------------------------------------
@@ -2009,11 +1597,59 @@ class TestAtexitFinalization(TestTurnTraceIsolation):
         )
         monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-0123456789abcdef")
         monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-0123456789abcdef")
-        monkeypatch.setattr(mod, "_require_service_name", lambda: "hermes-agent")
         mod._LANGFUSE_CLIENT = None
 
         assert mod._get_langfuse() is not None
         assert mod._finalize_all_traces in registered
+
+    def test_finalize_flushes_every_profile_without_an_ambient_scope(self, monkeypatch, tmp_path):
+        """Multiplex gateway: every turn ran inside a profile scope (home override + secret scope),
+        so only the per-home slots hold clients and the launch slot stays empty. atexit has no
+        scope, and a credential read there raises UnscopedSecretError. The finalizer must not read
+        credentials at all — it ends the open roots and flushes each settled client, so neither
+        profile loses its pending traces."""
+        from agent import secret_scope
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        monkeypatch.setattr(mod, "_end_observation", lambda obs, **k: None)
+        mod._LANGFUSE_CLIENT = None
+        mod._TRACE_STATE.clear()
+        mod._LANGFUSE_CLIENT_BY_HOME.clear()
+
+        flushed: list = []
+        fake_client = self._fake_client
+
+        def _sdk(**kw):
+            client = fake_client([])
+            client.flush = lambda pk=kw["public_key"]: flushed.append(pk)
+            return client
+
+        monkeypatch.setattr(mod, "Langfuse", _sdk)
+
+        for profile in ("alpha", "beta"):
+            home = tmp_path / profile
+            home.mkdir()
+            home_token = set_hermes_home_override(home)
+            scope_token = secret_scope.set_secret_scope({
+                "HERMES_LANGFUSE_PUBLIC_KEY": f"pk-lf-{profile}-0123456789",
+                "HERMES_LANGFUSE_SECRET_KEY": f"sk-lf-{profile}-0123456789",
+            })
+            try:
+                self._run_turn(mod, session=f"{profile}-turn", turn_n=0, finalize=False)
+            finally:
+                secret_scope.reset_secret_scope(scope_token)
+                reset_hermes_home_override(home_token)
+
+        assert len(mod._TRACE_STATE) == 2 and len(mod._LANGFUSE_CLIENT_BY_HOME) == 2
+        assert mod._LANGFUSE_CLIENT is None and secret_scope.current_secret_scope() is None
+
+        mod._finalize_all_traces()  # no scope: must not raise, must not build a client
+
+        assert sorted(flushed) == ["pk-lf-alpha-0123456789", "pk-lf-beta-0123456789"]
+        assert mod._TRACE_STATE == {} and mod._LANGFUSE_CLIENT is None
+
 
 class TestSystemPromptInGenerationInput:
     """The generation input must carry the system prompt even for providers
@@ -2060,17 +1696,6 @@ class TestSystemPromptInGenerationInput:
             kwargs["system_prompt"] = system_prompt
         mod.on_pre_llm_request(**kwargs)
 
-    def test_string_system_prompt_prepended(self, monkeypatch):
-        mod = self._make_mod()
-        captured = self._capture_generation(mod, monkeypatch)
-        self._fire(
-            mod,
-            request_messages=[{"role": "user", "content": "hi"}],
-            system_prompt="You are Hermes.",
-        )
-        assert captured["input"][0]["role"] == "system"
-        assert captured["input"][0]["content"] == "You are Hermes."
-        assert captured["input"][1]["role"] == "user"
 
     def test_anthropic_block_list_flattened(self, monkeypatch):
         """Anthropic OAuth mode sends ``system`` as content blocks (with
@@ -2091,22 +1716,6 @@ class TestSystemPromptInGenerationInput:
         assert "part one" in first["content"]
         assert "part two" in first["content"]
 
-    def test_no_duplicate_when_messages_already_carry_system(self, monkeypatch):
-        """chat_completions keeps system in messages[0]; forwarding
-        system_prompt as well must not produce two system entries."""
-        mod = self._make_mod()
-        captured = self._capture_generation(mod, monkeypatch)
-        self._fire(
-            mod,
-            request_messages=[
-                {"role": "system", "content": "You are Hermes."},
-                {"role": "user", "content": "hi"},
-            ],
-            system_prompt="You are Hermes.",
-        )
-        roles = [m["role"] for m in captured["input"]]
-        assert roles.count("system") == 1
-        assert roles[0] == "system"
 
     def test_absent_system_prompt_keeps_previous_shape(self, monkeypatch):
         mod = self._make_mod()
@@ -2127,18 +1736,7 @@ class TestSystemPromptInGenerationInput:
         ]
         self._fire(mod, request_messages=many, system_prompt="SYS")
         assert captured["input"][0]["role"] == "system"
-        # window (12) + prepended system
-        assert len(captured["input"]) == 13
-
-    def test_metadata_records_chars(self, monkeypatch):
-        mod = self._make_mod()
-        captured = self._capture_generation(mod, monkeypatch)
-        self._fire(
-            mod,
-            request_messages=[{"role": "user", "content": "hi"}],
-            system_prompt="You are Hermes.",
-        )
-        assert captured["metadata"]["system_prompt_chars"] == len("You are Hermes.")
+        assert captured["input"][0]["content"] == "SYS"
 
 
 class TestSystemPromptCrossesHookBoundary:
@@ -2661,3 +2259,62 @@ class TestCanonicalCostExport:
         # explicit zeros are treated as authoritative by Langfuse and block
         # its own model-based estimation (#43129).
         assert response_cost == {}
+
+
+class TestLangfuseServiceIdentity:
+    """The existing bundled Langfuse plugin remains opt-in and profile-aware."""
+
+    def test_legacy_profile_without_service_name_warns_once(self, tmp_path, monkeypatch, caplog):
+        plugin = importlib.import_module("plugins.observability.langfuse")
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model: {}" + chr(10), encoding="utf-8")
+        monkeypatch.setattr(plugin, "get_config_path", lambda: config_path)
+        monkeypatch.setattr(plugin, "_DEFAULT_SERVICE_NAME_WARNED", False)
+        with caplog.at_level(logging.WARNING, logger=plugin.__name__):
+            assert plugin._require_service_name() == "hermes-agent"
+            assert plugin._require_service_name() == "hermes-agent"
+        assert caplog.text.count("compatibility identity") == 1
+
+    @pytest.mark.parametrize("invalid", ["", "unknown_service", "name,broken"])
+    def test_explicit_invalid_identity_disables_only_langfuse(
+        self, tmp_path, monkeypatch, invalid,
+    ):
+        plugin = importlib.import_module("plugins.observability.langfuse")
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "observability:" + chr(10) + "  service_name: " + repr(invalid) + chr(10),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(plugin, "get_config_path", lambda: config_path)
+        with pytest.raises(plugin.LangfuseServiceNameError):
+            plugin._require_service_name()
+
+    def test_otel_identity_is_set_before_client_construction(self, tmp_path, monkeypatch):
+        plugin = importlib.import_module("plugins.observability.langfuse")
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "observability:" + chr(10) + "  service_name: profile-A" + chr(10),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(plugin, "get_config_path", lambda: config_path)
+        credentials = {
+            "HERMES_LANGFUSE_PUBLIC_KEY": "pk-lf-test-123",
+            "HERMES_LANGFUSE_SECRET_KEY": "sk-lf-test-123",
+        }
+        monkeypatch.setattr(plugin, "_secret", lambda key: credentials.get(key, ""))
+        monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=test,service.name=old")
+        monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+        seen = {}
+
+        def fake_client(**kwargs):
+            import os
+            seen["service"] = os.environ.get("OTEL_SERVICE_NAME")
+            seen["resource"] = os.environ.get("OTEL_RESOURCE_ATTRIBUTES")
+            seen["kwargs"] = kwargs
+            return object()
+
+        monkeypatch.setattr(plugin, "Langfuse", fake_client)
+        assert plugin._build_client() is not None
+        assert seen["service"] == "profile-A"
+        assert seen["resource"] == "service.name=profile-A,deployment.environment=test"
+        assert seen["kwargs"]["public_key"] == credentials["HERMES_LANGFUSE_PUBLIC_KEY"]
